@@ -312,14 +312,62 @@ const PATRONES = {
   ubicacion: h => /^UBICACION\b/.test(h)
 };
 
-async function cargarLotes(){
+/* Lectura principal: JSONP de Google (no depende de CORS, funciona dentro de Looker Studio,
+   en GitHub Pages e incluso abriendo el archivo con doble clic). */
+function leerGviz(){
+  return new Promise((ok, ko) => {
+    const cb = '__gv' + Date.now();
+    const s = document.createElement('script');
+    const alErr = ev => { if (ev.filename && ev.filename.indexOf('/gviz/') > -1){ ev.preventDefault(); fin(); ko(new Error('la hoja no es pública')); } };
+    window.addEventListener('error', alErr);
+    const fin = () => { clearTimeout(t); window.removeEventListener('error', alErr); try{ delete window[cb]; }catch(e){} s.remove(); };
+    const t = setTimeout(() => { fin(); ko(new Error('Google no respondió: revisa que la hoja esté compartida como "Cualquier persona con el enlace"')); }, 10000);
+    window[cb] = resp => {
+      fin();
+      if (!resp || resp.status === 'error'){
+        const m = resp && resp.errors && resp.errors[0] ? (resp.errors[0].detailed_message || resp.errors[0].message) : 'respuesta inválida';
+        return ko(new Error(m));
+      }
+      const cols = resp.table.cols, idx = cols.map(c => colIdx(c.id || 'A'));
+      const ancho = Math.max(...idx) + 1;
+      const fila = () => new Array(ancho).fill('');
+      const head = fila(); cols.forEach((c,i) => head[idx[i]] = c.label || '');
+      const out = [head];
+      (resp.table.rows || []).forEach(r => {
+        const f = fila();
+        (r.c || []).forEach((cell,i) => {
+          if (!cell || cell.v == null) return;
+          f[idx[i]] = typeof cell.v === 'number' ? String(cell.v) : String(cell.f ?? cell.v);
+        });
+        out.push(f);
+      });
+      ok(out);
+    };
+    s.onerror = () => { fin(); ko(new Error('no se pudo conectar con Google Sheets')); };
+    s.src = `https://docs.google.com/spreadsheets/d/${CONFIG.SHEET_ID}/gviz/tq?gid=${CONFIG.GID}&headers=1&tqx=out:json;responseHandler:${cb}&_=${Date.now()}`;
+    document.head.appendChild(s);
+  });
+}
+async function leerCSV(){
   const url = CONFIG.CSV_URL ||
     `https://docs.google.com/spreadsheets/d/${CONFIG.SHEET_ID}/gviz/tq?tqx=out:csv&gid=${CONFIG.GID}&headers=0&_=${Date.now()}`;
   const res = await fetch(url, {cache:'no-store'});
   if (!res.ok) throw new Error('HTTP ' + res.status);
   const txt = await res.text();
-  if (/^\s*<!DOCTYPE|<html/i.test(txt)) throw new Error('La hoja no es pública');
-  const rows = parseCSV(txt).filter(r => r.some(c => String(c).trim() !== ''));
+  if (/^\s*<!DOCTYPE|<html/i.test(txt)) throw new Error('la hoja no es pública');
+  return parseCSV(txt);
+}
+
+async function cargarLotes(){
+  let rows, errores = [];
+  const metodos = CONFIG.CSV_URL ? [leerCSV, leerGviz] : [leerGviz, leerCSV];
+  for (const m of metodos){
+    try { rows = await m(); if (rows && rows.length > 1) break; }
+    catch(e){ console.warn('[ficha]', m.name, e); errores.push(e.message); rows = null; }
+  }
+  if (!rows) throw new Error(errores[0] || 'sin datos');
+  rows = rows.filter(r => r.some(c => String(c).trim() !== ''));
+  window.__FILAS = rows;   // para diagnóstico en la consola
 
   // encontrar la fila de encabezados (la primera con al menos 2 títulos conocidos)
   let hi = -1;
@@ -426,6 +474,8 @@ function recalc(){
   setOut('AREA', isFinite(area) ? num2(area) + ' m²' : (L && L.areaTxt) || '');
   setOut('DIMENSIONES', val('dimensiones'));
   setOut('PRECIO', money(precio));
+  if (L && L !== recalc._ult){ recalc._ult = L;
+    if (!isFinite(L.precio) || !isFinite(L.area)) toast('Este lote no tiene ' + [!isFinite(L.area)&&'área (columna F)', !isFinite(L.precio)&&'precio (columna G)'].filter(Boolean).join(' ni ') + ' en la hoja.', 5000); }
   setOut('DESCUENTO', val('descuento') ? money(desc) : '');
   setOut('PRECIO_FINAL', money(pf));
   setOut('MODALIDAD', val('modalidad'));
